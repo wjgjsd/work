@@ -215,73 +215,6 @@ class SDPCrossAttention(nn.Module):
         )
         return self.to_out(out)
 
-
-# diffbir/model/attention.py에 추가
-
-class ImportanceGuidedCrossAttention(nn.Module):
-    """
-    중요도 맵을 활용한 Cross-Attention
-    """
-    def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.0):
-        super().__init__()
-        inner_dim = dim_head * heads
-        context_dim = default(context_dim, query_dim)
-        
-        self.heads = heads
-        self.dim_head = dim_head
-        self.scale = dim_head ** -0.5
-        
-        self.to_q = nn.Linear(query_dim, inner_dim, bias=False)
-        self.to_k = nn.Linear(context_dim, inner_dim, bias=False)
-        self.to_v = nn.Linear(context_dim, inner_dim, bias=False)
-        
-        self.to_out = nn.Sequential(
-            nn.Linear(inner_dim, query_dim), 
-            nn.Dropout(dropout)
-        )
-        
-        # 중요도 맵 처리를 위한 추가 레이어
-        self.importance_proj = nn.Conv2d(1, 1, kernel_size=1)
-        
-    def forward(self, x, context=None, mask=None, importance_map=None):
-        """
-        Args:
-            x: query features [B, N, C]
-            context: key/value features [B, M, C] (조건 이미지 특징)
-            importance_map: [B, 1, H, W] 중요도 맵
-        """
-        h = self.heads
-        
-        q = self.to_q(x)
-        context = default(context, x)
-        k = self.to_k(context)
-        v = self.to_v(context)
-        
-        q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> b h n d', h=h), (q, k, v))
-        
-        # Attention scores 계산
-        sim = einsum('b h i d, b h j d -> b h i j', q, k) * self.scale
-        
-        # 중요도 맵 적용
-        if importance_map is not None:
-            # importance_map을 attention 차원에 맞게 변환
-            # [B, 1, H, W] -> [B, H*W] -> [B, 1, 1, H*W]
-            B, _, H, W = importance_map.shape
-            importance_weights = importance_map.flatten(2)  # [B, 1, H*W]
-            importance_weights = importance_weights.unsqueeze(1)  # [B, 1, 1, H*W]
-            
-            # Softmax 전에 중요도를 반영
-            sim = sim + importance_weights  # Broadcasting
-        
-        # Attention 적용
-        attn = sim.softmax(dim=-1)
-        
-        out = einsum('b h i j, b h j d -> b h i d', attn, v)
-        out = rearrange(out, 'b h n d -> b n (h d)')
-        
-        return self.to_out(out)
-
-
 class BasicTransformerBlock(nn.Module):
     ATTENTION_MODES = {
         AttnMode.VANILLA: CrossAttention,  # vanilla attention
@@ -419,32 +352,28 @@ class SpatialTransformer(nn.Module):
         return x + x_in
     
 
+
 class ImportanceSpatialTransformer(nn.Module):
     """
-    중요도 맵을 활용한 Spatial Transformer.
-    이미지 feature가 importance map을 참조하여 가중치를 학습.
+    SpatialTransformer with Importance Attention
     """
-
     def __init__(
         self,
         in_channels,
         n_heads,
         d_head,
         depth=1,
-        dropout=0.0,
+        dropout=0.,
         context_dim=None,
         disable_self_attn=False,
         use_linear=False,
         use_checkpoint=True,
     ):
         super().__init__()
-        if exists(context_dim) and not isinstance(context_dim, list):
-            context_dim = [context_dim]
         self.in_channels = in_channels
         inner_dim = n_heads * d_head
         self.norm = Normalize(in_channels)
         
-        # ⭐ Input projection
         if not use_linear:
             self.proj_in = nn.Conv2d(
                 in_channels, inner_dim, kernel_size=1, stride=1, padding=0
@@ -452,164 +381,144 @@ class ImportanceSpatialTransformer(nn.Module):
         else:
             self.proj_in = nn.Linear(in_channels, inner_dim)
         
-        # ⭐ Importance map을 embedding으로 변환
-        # [B, 1, H, W] → [B, HW, embed_dim]
-        self.importance_embed = nn.Sequential(
-            nn.Conv2d(1, inner_dim // 4, kernel_size=3, padding=1),
-            nn.GELU(),
-            nn.Conv2d(inner_dim // 4, inner_dim, kernel_size=3, padding=1),
-        )
+        # ⭐ ImportanceBasicTransformerBlock 사용!
+        self.transformer_blocks = nn.ModuleList([
+            ImportanceBasicTransformerBlock(
+                inner_dim,
+                n_heads,
+                d_head,
+                dropout=dropout,
+                context_dim=context_dim,  # 1024 (text)
+                checkpoint=use_checkpoint,
+                disable_self_attn=disable_self_attn,
+            )
+            for _ in range(depth)
+        ])
         
-        # ⭐ Transformer blocks
-        self.transformer_blocks = nn.ModuleList(
-            [
-                ImportanceTransformerBlock(
-                    inner_dim,
-                    n_heads,
-                    d_head,
-                    dropout=dropout,
-                    context_dim=context_dim[d],
-                    disable_self_attn=disable_self_attn,
-                    checkpoint=use_checkpoint,
-                )
-                for d in range(depth)
-            ]
-        )
-        
-        # ⭐ Output projection
         if not use_linear:
             self.proj_out = zero_module(
                 nn.Conv2d(inner_dim, in_channels, kernel_size=1, stride=1, padding=0)
             )
         else:
-            self.proj_out = zero_module(nn.Linear(in_channels, inner_dim))
+            self.proj_out = zero_module(nn.Linear(inner_dim, in_channels))
         
         self.use_linear = use_linear
-
-    def forward(self, x, importance_map=None):
-        """
-        Args:
-            x: [B, C, H, W] - 이미지 feature
-            importance_map: [B, 1, H, W] - 중요도 맵
-        Returns:
-            [B, C, H, W] - 중요도로 가중된 feature
-        """
+    
+    def forward(self, x, context=None, importance_map=None):
+        # x: [B, C, H, W]
         b, c, h, w = x.shape
         x_in = x
         
-        # ⭐ Feature normalization
         x = self.norm(x)
         
-        # ⭐ Project feature to transformer space
         if not self.use_linear:
-            x = self.proj_in(x)  # [B, inner_dim, H, W]
+            x = self.proj_in(x)
         
-        x = rearrange(x, "b c h w -> b (h w) c").contiguous()  # [B, HW, inner_dim]
+        # [B, C, H, W] → [B, H*W, C]
+        x = rearrange(x, 'b c h w -> b (h w) c').contiguous()
         
         if self.use_linear:
             x = self.proj_in(x)
         
-        # ⭐ Importance map embedding
-        # [B, 1, H, W] → [B, inner_dim, H, W] → [B, HW, inner_dim]
-        importance_embed = None
+        # ⭐ Importance map 처리
+        importance_context = None
         if importance_map is not None:
-            importance_embed = self.importance_embed(importance_map)
-            importance_embed = rearrange(
-                importance_embed, "b c h w -> b (h w) c"
+            # [B, 1, H_map, W_map] → [B, H, W] resize
+            imp_resized = F.interpolate(
+                importance_map,
+                size=(h, w),
+                mode='bilinear',
+                align_corners=False
+            )
+            # [B, 1, H, W] → [B, H*W, 1]
+            importance_context = rearrange(
+                imp_resized,
+                'b c h w -> b (h w) c'
             ).contiguous()
         
-        # ⭐ Apply transformer blocks
+        # ⭐ Transformer blocks
         for block in self.transformer_blocks:
-            x = block(x, importance_context=importance_embed)
+            x = block(
+                x, 
+                context=context,  # text: [B, 77, 1024]
+                importance_context=importance_context  # [B, H*W, 1]
+            )
         
-        # ⭐ Project back
         if self.use_linear:
             x = self.proj_out(x)
         
-        x = rearrange(x, "b (h w) c -> b c h w", h=h, w=w).contiguous()
+        # [B, H*W, C] → [B, C, H, W]
+        x = rearrange(x, 'b (h w) c -> b c h w', h=h, w=w).contiguous()
         
         if not self.use_linear:
             x = self.proj_out(x)
         
-        # ⭐ Residual connection
         return x + x_in
 
 
-class ImportanceTransformerBlock(nn.Module):
+class ImportanceBasicTransformerBlock(BasicTransformerBlock):
     """
-    중요도 맵을 참조하는 Transformer Block.
-    BasicTransformerBlock과 유사하지만 importance map을 context로 사용.
+    BasicTransformerBlock + Importance Cross-Attention
     """
-    ATTENTION_MODES = {
-        AttnMode.VANILLA: CrossAttention,  # vanilla attention
-        AttnMode.XFORMERS: MemoryEfficientCrossAttention,
-        AttnMode.SDP: SDPCrossAttention,
-    }
-
     def __init__(
         self,
         dim,
         n_heads,
         d_head,
-        dropout=0.0,
+        dropout=0.,
         context_dim=None,
         gated_ff=True,
         checkpoint=True,
         disable_self_attn=False,
     ):
-        super().__init__()
-        attn_cls = self.ATTENTION_MODES[Config.attn_mode]
-        self.disable_self_attn = disable_self_attn
+        # ⭐ 부모 초기화 (attn1, attn2, ff 생성)
+        super().__init__(
+            dim=dim,
+            n_heads=n_heads,
+            d_head=d_head,
+            dropout=dropout,
+            context_dim=context_dim,
+            gated_ff=gated_ff,
+            checkpoint=checkpoint,
+            disable_self_attn=disable_self_attn,
+        )
         
-        # ⭐ Self-attention (feature 내부)
-        self.attn1 = attn_cls(
+        # ⭐ attn3 추가 (importance cross-attention)
+        self.attn_importance = CrossAttention(
             query_dim=dim,
+            context_dim=1,  # importance_map: [B, H*W, 1]
             heads=n_heads,
             dim_head=d_head,
             dropout=dropout,
         )
-        
-        # ⭐ Feed-forward
-        self.ff = FeedForward(dim, dropout=dropout, glu=gated_ff)
-
-        # ⭐ Cross-attention (feature ← importance)
-        self.attn2 = attn_cls(
-            query_dim=dim,
-            context_dim=dim,  # importance_embed의 출력 차원과 일치
-            heads=n_heads,
-            dim_head=d_head,
-            dropout=dropout,
-        )
-        
-        # ⭐ LayerNorms
-        self.norm1 = nn.LayerNorm(dim)
-        self.norm2 = nn.LayerNorm(dim)
-        self.norm3 = nn.LayerNorm(dim)
-        
-        self.checkpoint = checkpoint
-
-    def forward(self, x, importance_context):
-        """
-        Args:
-            x: [B, N, C] - feature tokens
-            importance_context: [B, N, C] - importance map embedding
-        """
+        self.norm_importance = nn.LayerNorm(dim)
+    
+    def forward(self, x, context=None, importance_context=None):
         return checkpoint(
             self._forward, 
-            (x, importance_context), 
+            (x, context, importance_context), 
             self.parameters(), 
             self.checkpoint
         )
-
-    def _forward(self, x, importance_context):
-        # ⭐ Self-attention (feature 자체의 관계)
-        x = self.attn1(self.norm1(x)) + x
+    
+    def _forward(self, x, context=None, importance_context=None):
+        # ⭐ attn1: self-attention
+        x = self.attn1(
+            self.norm1(x), 
+            context=x if self.disable_self_attn else None
+        ) + x
         
-        # ⭐ Cross-attention (feature가 importance를 참조)
-        # Query: feature, Key/Value: importance
-        x = self.attn2(self.norm2(x), context=importance_context) + x
+        # ⭐ attn2: text cross-attention
+        x = self.attn2(self.norm2(x), context=context) + x
         
-        # ⭐ Feed-forward
+        # ⭐ attn3: importance cross-attention (새로 추가!)
+        if importance_context is not None:
+            x = self.attn_importance(
+                self.norm_importance(x), 
+                context=importance_context
+            ) + x
+        
+        # ⭐ feed-forward
         x = self.ff(self.norm3(x)) + x
         
         return x

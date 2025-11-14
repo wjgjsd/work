@@ -41,13 +41,15 @@ class TimestepEmbedSequential(nn.Sequential, TimestepBlock):
         for layer in self:
             if isinstance(layer, TimestepBlock):
                 x = layer(x, emb)
+            elif isinstance(layer, ImportanceSpatialTransformer):
+                x = layer(x, context, importance_map)
             elif isinstance(layer, SpatialTransformer):
                 x = layer(x, context)
-            elif isinstance(layer, ImportanceSpatialTransformer):
-                x = layer(x, importance_map)
             else:
                 x = layer(x)
         return x
+    
+
 
 
 class Upsample(nn.Module):

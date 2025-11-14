@@ -117,7 +117,8 @@ batch_transform:
 
 train:
   # ⭐ 가중치 경로
-  sd_path: ./weights/v2.pth
+  sd_path: ./weights/v2-1_512-ema-pruned_original.ckpt
+  ControlNet_path: ./weights/v2_original.pth
   swinir_path: ./weights/realesrgan_s4_swinir_100k.pth  # ⭐ Cleaner weights
   importance_net_path: ./importance_net_weights.pth  # ⭐ Importance net
   # ⭐ 실험 폴더
@@ -128,7 +129,7 @@ train:
   
   # ⭐ Hyperparameters
   learning_rate: 1e-4
-  batch_size: 1
+  batch_size: 2
   num_workers: 4
   train_steps: 30000
   log_every: 50

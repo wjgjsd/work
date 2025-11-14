@@ -1,39 +1,42 @@
 """
-ImportanceSpatialTransformer 학습 스크립트 (train_stage2.py 기반)
-- ControlLDM의 ImportanceSpatialTransformer (LoRA)만 학습시킵니다.
+ImportanceSpatialTransformer 학습 스크립트
+- SD UNet + ControlNet 가중치 로드
+- attn_importance만 학습
+- 최종 통합 가중치 저장
 """
 
 import os
 from argparse import ArgumentParser
 import copy
-from diffbir.importance_map_net import SharedEncoderImportanceNet # ⭐ 추가
-from peft import LoraConfig, inject_adapter_in_model, TaskType # ⭐ 추가
+from pathlib import Path
+from diffbir.importance_map_net import SharedEncoderImportanceNet
+from peft import LoraConfig, inject_adapter_in_model, TaskType
 
 from omegaconf import OmegaConf
 import torch
 import random
 from torch.utils.data import DataLoader
 from torchvision.utils import make_grid
-from torch.nn import functional as F # ⭐ F.interpolate 사용을 위해 추가
+from torch.nn import functional as F
 from accelerate import Accelerator
 from accelerate.utils import set_seed
 from einops import rearrange
 from tqdm import tqdm
 from torch.utils.tensorboard import SummaryWriter
 
-from diffbir.model import ControlLDM, SwinIR, Diffusion # SwinIR은 train_stage2에서 사용
+from diffbir.model import ControlLDM, SwinIR, Diffusion
 from diffbir.utils.common import instantiate_from_config, to, log_txt_as_img
 from diffbir.sampler import SpacedSampler
 
 
 def main(args) -> None:
     # ========== Setup ==========
-    accelerator = Accelerator(split_batches=True, mixed_precision='fp16') # ⭐ fp16 추가
+    accelerator = Accelerator(split_batches=True, mixed_precision='fp16')
     set_seed(231, device_specific=True)
     device = accelerator.device
     cfg = OmegaConf.load(args.config)
 
-    # Setup an experiment folder:
+    # Setup experiment folder
     if accelerator.is_main_process:
         exp_dir = cfg.train.exp_dir
         os.makedirs(exp_dir, exist_ok=True)
@@ -41,40 +44,91 @@ def main(args) -> None:
         os.makedirs(ckpt_dir, exist_ok=True)
         print(f"Experiment directory created at {exp_dir}")
 
-    # ========== Load ControlLDM ==========
+    # ========== Load ControlLDM with ImportanceSpatialTransformer ==========
+    if accelerator.is_main_process:
+        print("\n" + "="*60)
+        print("Loading models...")
+        print("="*60)
+    
     cldm: ControlLDM = instantiate_from_config(cfg.model.cldm)
-    sd_checkpoint = torch.load(cfg.train.sd_path, map_location="cpu")
+    
+    # ========== Load SD UNet weights ==========
+    if accelerator.is_main_process:
+        print(f"\n① Loading SD checkpoint from: {cfg.train.sd_path}")
+    
+    sd_checkpoint = torch.load(cfg.train.sd_path, map_location="cpu", weights_only=False)
     if "state_dict" in sd_checkpoint:
         sd = sd_checkpoint["state_dict"]
     else:
         sd = sd_checkpoint
+    
     unused, missing = cldm.load_pretrained_sd(sd)
+    
     if accelerator.is_main_process:
-        print(
-            f"strictly load pretrained SD weight from {cfg.train.sd_path}\n"
-            f"unused weights: {unused}\n"
-            f"missing weights: {missing}"
-        )
+        print(f"   ✅ Loaded SD UNet weights")
+        if unused:
+            print(f"   ⚠️  Unused SD weights: {len(unused)} keys")
+        if missing:
+            print(f"   ⚠️  Missing SD weights: {len(missing)} keys")
+            # attn_importance 관련은 정상 (새로 추가된 거니까)
+            missing_importance = [k for k in missing if 'attn_importance' in k]
+            missing_other = [k for k in missing if 'attn_importance' not in k]
+            print(f"      - attn_importance (expected): {len(missing_importance)}")
+            print(f"      - others (unexpected): {len(missing_other)}")
+            if missing_other:
+                print(f"      ⚠️  Warning: {missing_other[:5]}...")
 
-    # Load ControlNet
+    # ========== Load ControlNet weights ==========
+    if accelerator.is_main_process:
+        print(f"\n② Loading ControlNet checkpoint")
+    
     if cfg.train.resume:
-        cldm.load_controlnet_from_ckpt(torch.load(cfg.train.resume, map_location="cpu"))
+        # 이전 학습 재개
+        control_checkpoint = torch.load(cfg.train.resume, map_location="cpu", weights_only=False)
+        cldm.load_controlnet_from_ckpt(control_checkpoint)
         if accelerator.is_main_process:
-            print(
-                f"strictly load controlnet weight from checkpoint: {cfg.train.resume}"
-            )
+            print(f"   ✅ Resumed from: {cfg.train.resume}")
+    
+    elif hasattr(cfg.train, 'controlnet_path') and cfg.train.controlnet_path:
+        # ControlNet 가중치 로드
+        control_checkpoint = torch.load(
+            cfg.train.controlnet_path, 
+            map_location="cpu", 
+            weights_only=False
+        )
+        
+        # state_dict 추출
+        if isinstance(control_checkpoint, dict) and 'state_dict' in control_checkpoint:
+            control_sd = control_checkpoint['state_dict']
+        else:
+            control_sd = control_checkpoint
+        
+        # ControlNet에 로드
+        missing_ctrl, unexpected_ctrl = cldm.load_controlnet_from_ckpt(control_sd, strict=False)
+        
+        if accelerator.is_main_process:
+            print(f"   ✅ Loaded ControlNet from: {cfg.train.controlnet_path}")
+            if missing_ctrl:
+                missing_importance = [k for k in missing_ctrl if 'attn_importance' in k]
+                missing_other = [k for k in missing_ctrl if 'attn_importance' not in k]
+                print(f"      - Missing attn_importance (expected): {len(missing_importance)}")
+                if missing_other:
+                    print(f"      ⚠️  Missing others: {len(missing_other)}")
+    
     else:
+        # UNet에서 초기화
         init_with_new_zero, init_with_scratch = cldm.load_controlnet_from_unet()
         if accelerator.is_main_process:
-            print(
-                f"strictly load controlnet weight from pretrained SD\n"
-                f"weights initialized with newly added zeros: {init_with_new_zero}\n"
-                f"weights initialized from scratch: {init_with_scratch}"
-            )
+            print(f"   ✅ Initialized ControlNet from UNet")
+            print(f"      - New zero conv: {len(init_with_new_zero)}")
+            print(f"      - From scratch: {len(init_with_scratch)}")
     
     # ========== Load Cleaner (SwinIR) - FROZEN ==========
+    if accelerator.is_main_process:
+        print(f"\n③ Loading SwinIR (cleaner)")
+    
     swinir: SwinIR = instantiate_from_config(cfg.model.swinir)
-    swinir_weight = torch.load(cfg.train.swinir_path, map_location="cpu")
+    swinir_weight = torch.load(cfg.train.swinir_path, map_location="cpu", weights_only=False)
     if "state_dict" in swinir_weight:
         swinir_weight = swinir_weight["state_dict"]
     swinir_weight = {
@@ -85,78 +139,89 @@ def main(args) -> None:
     swinir.eval().to(device)
     for p in swinir.parameters():
         p.requires_grad = False
+    
     if accelerator.is_main_process:
-        print(f"✅ Loaded frozen SwinIR from {cfg.train.swinir_path}")
+        print(f"   ✅ Loaded frozen SwinIR")
 
-    # ========== Load Importance Net - FROZEN (⭐ 추가) ==========
+    # ========== Load Importance Net - FROZEN ==========
+    if accelerator.is_main_process:
+        print(f"\n④ Loading Importance Network")
+    
     importance_net = SharedEncoderImportanceNet(in_channels=3)
     importance_net.load_state_dict(
-        torch.load(cfg.train.importance_net_path, map_location=device)
+        torch.load(cfg.train.importance_net_path, map_location=device, weights_only=False)
     )
     importance_net.to(device)
     importance_net.eval()
     for param in importance_net.parameters():
         param.requires_grad = False
+    
     if accelerator.is_main_process:
-        print("✅ Loaded frozen importance_net")
+        print(f"   ✅ Loaded frozen Importance Network")
     
     # ========== Load Diffusion ==========
     diffusion: Diffusion = instantiate_from_config(cfg.model.diffusion)
     diffusion.to(device)
 
-    # ========== Freeze All & Apply LoRA to ImportanceSpatialTransformer ==========
+    # ========== Freeze All & Make attn_importance Trainable ==========
+    if accelerator.is_main_process:
+        print(f"\n⑤ Setting up trainable parameters")
+    
     for param in cldm.parameters():
         param.requires_grad = False
     
-    lora_config = LoraConfig(
-        r=8,
-        lora_alpha=32,
-        target_modules=["to_q", "to_k", "to_v", "to_out.0"],
-        lora_dropout=0.1,
-        bias="none",
-    )
-
     trainable_params = []
-    trainable_module_names = []
+    attn_importance_count = 0
+    unet_importance_count = 0
+    controlnet_importance_count = 0
     
-    # ImportanceSpatialTransformer 찾아서 LoRA 적용
-    for name, module in cldm.named_modules():
+    for module_name, module in cldm.named_modules():
         module_type = type(module).__name__
-        if 'ImportanceSpatialTransformer' in module_type:
-            trainable_module_names.append(name)
-            try:
-                inject_adapter_in_model(lora_config, module, adapter_name="default")
-                if accelerator.is_main_process:
-                    print(f"  ✅ Applied LoRA to: {name}")
-            except Exception as e:
-                if accelerator.is_main_process:
-                    print(f"  ⚠️  Failed to apply LoRA to {name}: {e}")
+        
+        if 'ImportanceBasicTransformerBlock' in module_type:
+            attn_importance_count += 1
+            
+            if hasattr(module, 'attn_importance'):
+                # attn_importance 파라미터 trainable
+                for param in module.attn_importance.parameters():
+                    param.requires_grad = True
+                    trainable_params.append(param)
+                
+                # norm_importance도 trainable
+                if hasattr(module, 'norm_importance'):
+                    for param in module.norm_importance.parameters():
+                        param.requires_grad = True
+                        trainable_params.append(param)
+                
+                # Count per network
+                if 'unet.' in module_name:
+                    unet_importance_count += 1
+                elif 'controlnet.' in module_name:
+                    controlnet_importance_count += 1
 
-    # LoRA 파라미터만 수집
-    trainable_count = 0
-    for name, param in cldm.named_parameters():
-        if 'lora' in name.lower():
-            param.requires_grad = True
-            trainable_params.append(param)
-            trainable_count += param.numel()
+    # Summary
+    trainable_count = sum(p.numel() for p in trainable_params)
+    total_params = sum(p.numel() for p in cldm.parameters())
 
     if accelerator.is_main_process:
-        total_params = sum(p.numel() for p in cldm.parameters())
         print(f"\n{'='*60}")
-        print(f"Found {len(trainable_module_names)} ImportanceSpatialTransformer modules.")
-        print(f"\n📊 Parameters:")
-        print(f"   Total: {total_params:,}")
-        print(f"   Trainable (LoRA): {trainable_count:,} ({trainable_count/total_params*100:.2f}%)")
-        print(f"   Frozen: {total_params - trainable_count:,}")
+        print(f"Training Setup Summary")
+        print(f"{'='*60}")
+        print(f"ImportanceBasicTransformerBlock modules:")
+        print(f"   - UNet: {unet_importance_count}")
+        print(f"   - ControlNet: {controlnet_importance_count}")
+        print(f"   - Total: {attn_importance_count}")
+        print(f"\nParameters:")
+        print(f"   - Total: {total_params:,}")
+        print(f"   - Trainable (attn_importance): {trainable_count:,} ({trainable_count/total_params*100:.4f}%)")
+        print(f"   - Frozen: {total_params - trainable_count:,} ({(total_params - trainable_count)/total_params*100:.2f}%)")
         print(f"{'='*60}\n")
 
     if len(trainable_params) == 0:
-        raise ValueError(
-            "❌ No trainable LoRA parameters found! Check if LoRA injection succeeded."
-        )
+        raise ValueError("❌ No trainable parameters found!")
 
-    # Setup optimizer:
-    opt = torch.optim.AdamW(trainable_params, lr=cfg.train.learning_rate) # ⭐ ControlNet 대신 LoRA 파라미터로 수정
+    # ========== Optimizer ==========
+    opt = torch.optim.AdamW(trainable_params, lr=cfg.train.learning_rate)
 
     # ========== Data Setup ==========
     dataset = instantiate_from_config(cfg.dataset.train)
@@ -173,7 +238,7 @@ def main(args) -> None:
 
     batch_transform = instantiate_from_config(cfg.batch_transform)
 
-    # Prepare models for training:
+    # Prepare models for training
     cldm.train().to(device)
     swinir.eval()
     diffusion.to(device)
@@ -181,7 +246,7 @@ def main(args) -> None:
     pure_cldm: ControlLDM = accelerator.unwrap_model(cldm)
     noise_aug_timestep = cfg.train.noise_aug_timestep
 
-    # Variables for monitoring/logging purposes:
+    # Training variables
     global_step = 0
     max_steps = cfg.train.train_steps
     step_loss = []
@@ -194,6 +259,7 @@ def main(args) -> None:
         writer = SummaryWriter(exp_dir)
         print(f"Training for {max_steps} steps...")
 
+    # ========== Training Loop ==========
     while global_step < max_steps:
         pbar = tqdm(
             iterable=None,
@@ -204,72 +270,44 @@ def main(args) -> None:
         for batch in loader:
             to(batch, device)
             batch = batch_transform(batch)
-            # ⭐ train_stage2.py 기반 Unpack
             gt, lq, prompt = batch 
             gt = rearrange(gt, "b h w c -> b c h w").contiguous().float()
             lq = rearrange(lq, "b h w c -> b c h w").contiguous().float()
 
-            # --- ⭐ HQ/LQ 크롭 로직 (메모리 부족 방지 위해 다시 삽입) ---
-            TARGET_SIZE = 128
-            b_size, _, h_init, w_init = gt.size() # [B, C, H, W]
+            # Crop for memory efficiency
+            TARGET_SIZE = 1024
+            b_size, _, h_init, w_init = gt.size()
             
             if h_init >= TARGET_SIZE and w_init >= TARGET_SIZE:
-                
-                # H, W 슬라이싱이 아닌 C, H, W 슬라이싱을 위해 B, C, H, W 순서로 가정
                 h_c, w_c = gt.shape[2], gt.shape[3]
-                
-                # 크롭 시작 지점 무작위 선택
                 rand_h = random.randint(0, h_c - TARGET_SIZE)
                 rand_w = random.randint(0, w_c - TARGET_SIZE)
-                
-                # HQ 이미지 크롭 (gt는 [B, C, H, W])
                 gt = gt[:, :, rand_h:rand_h + TARGET_SIZE, rand_w:rand_w + TARGET_SIZE]
                 
-                # LQ 이미지 크롭 (lq는 [B, C, H_lq, W_lq])
                 SCALE_FACTOR = h_init // lq.shape[2] 
                 TARGET_LQ_SIZE = TARGET_SIZE // SCALE_FACTOR
-                
                 rand_h_lq = rand_h // SCALE_FACTOR 
                 rand_w_lq = rand_w // SCALE_FACTOR
-                
                 lq = lq[:, :, rand_h_lq:rand_h_lq + TARGET_LQ_SIZE, rand_w_lq:rand_w_lq + TARGET_LQ_SIZE]
             
-            # --- ⭐ 크롭 로직 종료 ---
-            
             with torch.no_grad():
-                # ⭐ VAE 인코딩 (GT)
                 z_0 = pure_cldm.vae_encode(gt)
-                
-                # ⭐ Cleaner (SwinIR) 호출
                 clean = swinir(lq)
                 
-                # HQ 크기에 맞춰 Clean 이미지 리사이즈 (train_stage2.py에는 없는 로직)
-                # VAE 인코딩 전에 Clean 이미지 크기를 Latent Space와 일치시켜야 할 수 있음
-                # 현재는 Cleaner의 출력이 VAE 입력 크기에 맞아야 하므로, 
-                # clean.shape[2:]가 512x512를 유지하도록 보장해야 합니다.
-                
-                # LQ upsampling (cleaner의 출력 크기가 4x라고 가정)
                 if clean.shape[2] != gt.shape[2] or clean.shape[3] != gt.shape[3]:
                     clean = F.interpolate(
-                        clean,
-                        size=gt.shape[2:],
-                        mode='bicubic',
-                        align_corners=False
+                        clean, size=gt.shape[2:],
+                        mode='bicubic', align_corners=False
                     )
                 
-                # ⭐ Importance Map 생성 로직 (⭐ 추가)
                 lq_upsampled = F.interpolate(
-                    lq,
-                    size=clean.shape[2:],
-                    mode='bicubic',
-                    align_corners=False
+                    lq, size=clean.shape[2:],
+                    mode='bicubic', align_corners=False
                 )
-                importance_map = importance_net(clean, lq_upsampled) # ⭐ importance_map 생성
+                importance_map = importance_net(clean, lq_upsampled)
                 
-                # ⭐ Condition 준비 (train_stage2.py 기반)
                 cond = pure_cldm.prepare_condition(clean, prompt)
                 
-                # noise augmentation
                 cond_aug = copy.deepcopy(cond)
                 if noise_aug_timestep > 0:
                     cond_aug["c_img"] = diffusion.q_sample(
@@ -280,25 +318,20 @@ def main(args) -> None:
                         noise=torch.randn_like(cond_aug["c_img"]),
                     )
                 
-                # Importance Map 크기를 Latent Size에 맞게 조정 (⭐ 추가)
-                """importance_map_latent = F.interpolate(
-                    importance_map,
-                    size=z_0.shape[2:], # Latent Size (예: 64x64)
-                    mode='bilinear',
-                    align_corners=False
-                )"""
+                importance_map_latent = F.interpolate(
+                    importance_map, size=z_0.shape[2:],
+                    mode='bilinear', align_corners=False
+                )
 
             t = torch.randint(
                 0, diffusion.num_timesteps, (z_0.shape[0],), device=device
             )
 
-            # ⭐ Forward 호출 시 importance_map_latent 전달
-            loss = diffusion.p_losses(cldm, z_0, t, cond_aug, importance_map)
+            loss = diffusion.p_losses(cldm, z_0, t, cond_aug, importance_map_latent)
             
             opt.zero_grad()
             accelerator.backward(loss)
             opt.step()
-
             accelerator.wait_for_everyone()
 
             global_step += 1
@@ -309,9 +342,8 @@ def main(args) -> None:
                 f"Epoch: {epoch:04d}, Global Step: {global_step:07d}, Loss: {loss.item():.6f}"
             )
 
-            # Log loss values:
+            # Log loss
             if global_step % cfg.train.log_every == 0 and global_step > 0:
-                # Gather values from all processes
                 avg_loss = (
                     accelerator.gather(
                         torch.tensor(step_loss, device=device).unsqueeze(0)
@@ -323,21 +355,21 @@ def main(args) -> None:
                 if accelerator.is_main_process:
                     writer.add_scalar("loss/loss_simple_step", avg_loss, global_step)
 
-            # Save checkpoint:
+            # Save checkpoint (intermediate - attn_importance only)
             if global_step % cfg.train.ckpt_every == 0 and global_step > 0:
                 if accelerator.is_main_process:
-                    # ⭐ LoRA/Adapter 가중치만 저장
+                    # 중간 저장: attn_importance만
                     adapter_state_dict = {}
                     for name, param in pure_cldm.named_parameters():
-                        if 'lora' in name.lower() and param.requires_grad:
+                        if 'attn_importance' in name and param.requires_grad:
                             adapter_state_dict[name] = param.cpu().clone()
 
-                    ckpt_path = f"{ckpt_dir}/{global_step:07d}.pt"
-                    torch.save(adapter_state_dict, ckpt_path) # ⭐ Adapter만 저장하도록 수정
+                    ckpt_path = f"{ckpt_dir}/{global_step:07d}_attn_importance_only.pt"
+                    torch.save(adapter_state_dict, ckpt_path)
+                    print(f"   💾 Saved intermediate checkpoint: {ckpt_path}")
 
+            # Log images
             if global_step % cfg.train.image_every == 0 or global_step == 1:
-                # ... (로깅 로직은 train_stage2.py와 동일하게 유지)
-                # ...
                 N = 8
                 log_clean = clean[:N]
                 log_cond = {k: v[:N] for k, v in cond.items()}
@@ -362,30 +394,224 @@ def main(args) -> None:
                             ("image/gt", (log_gt + 1) / 2),
                             ("image/lq", log_lq),
                             ("image/condition", log_clean),
-                            (
-                                "image/condition_decoded",
-                                (pure_cldm.vae_decode(log_cond["c_img"]) + 1) / 2,
-                            ),
-                            (
-                                "image/condition_aug_decoded",
-                                (pure_cldm.vae_decode(log_cond_aug["c_img"]) + 1) / 2,
-                            ),
-                            (
-                                "image/prompt",
-                                (log_txt_as_img((512, 512), log_prompt) + 1) / 2,
-                            ),
-                            # ⭐ 중요도 맵 로깅 추가
-                            ("image/importance_map", importance_map[:N]), 
+                            ("image/condition_decoded", (pure_cldm.vae_decode(log_cond["c_img"]) + 1) / 2),
+                            ("image/condition_aug_decoded", (pure_cldm.vae_decode(log_cond_aug["c_img"]) + 1) / 2),
+                            ("image/prompt", (log_txt_as_img((512, 512), log_prompt) + 1) / 2),
+                            ("image/importance_map", importance_map[:N]),
                         ]:
                             writer.add_image(tag, make_grid(image, nrow=4), global_step)
                 cldm.train()
+            
             accelerator.wait_for_everyone()
             if global_step == max_steps:
                 break
 
         pbar.close()
-        # ... (후반 로깅 및 종료 로직은 동일)
-        # ...
+        epoch += 1
+
+    # ========== Save Final Integrated Checkpoint ==========
+    if accelerator.is_main_process:
+        save_final_checkpoint(pure_cldm, cfg, exp_dir)
+    
+    accelerator.wait_for_everyone()
+    if accelerator.is_main_process:
+        writer.close()
+        print("Training completed!")
+
+
+def save_final_checkpoint(cldm, cfg, exp_dir):
+    """
+    최종 가중치를 2개 파일로 저장:
+    1. SD UNet with importance (for inference/finetuning)
+    2. ControlNet with importance (for ControlLDM)
+    """
+    print("\n" + "="*80)
+    print("Saving FINAL CHECKPOINTS (2 files)")
+    print("="*80)
+    
+    # ========== Step 1: Load Original SD Checkpoint ==========
+    print("\n① Loading original SD checkpoint...")
+    sd_checkpoint = torch.load(cfg.train.sd_path, map_location="cpu", weights_only=False)
+    
+    if 'state_dict' in sd_checkpoint:
+        sd_state = sd_checkpoint['state_dict']
+    else:
+        sd_state = sd_checkpoint
+    
+    print(f"   ✅ Loaded: {cfg.train.sd_path}")
+    print(f"   Total keys: {len(sd_state)}")
+    
+    # ========== Step 2: Extract Current Model State ==========
+    print("\n② Extracting trained weights...")
+    
+    current_state = cldm.state_dict()
+    
+    # Separate by network
+    unet_weights = {}
+    controlnet_weights = {}
+    
+    for key, value in current_state.items():
+        if key.startswith('unet.'):
+            unet_weights[key] = value.cpu()
+        elif key.startswith('controlnet.'):
+            controlnet_weights[key] = value.cpu()
+    
+    print(f"   - UNet weights: {len(unet_weights)}")
+    print(f"   - ControlNet weights: {len(controlnet_weights)}")
+    
+    # Count attn_importance
+    unet_importance = [k for k in unet_weights.keys() if 'attn_importance' in k]
+    ctrl_importance = [k for k in controlnet_weights.keys() if 'attn_importance' in k]
+    
+    print(f"\n   attn_importance parameters:")
+    print(f"   - UNet: {len(unet_importance)}")
+    print(f"   - ControlNet: {len(ctrl_importance)}")
+    
+    # ========== Step 3: Build SD Checkpoint (UNet + VAE + CLIP + importance) ==========
+    print("\n③ Building SD checkpoint with importance...")
+    
+    sd_final = {}
+    
+    # Add original SD components (VAE, CLIP, etc.)
+    for key, value in sd_state.items():
+        if key.startswith('first_stage_model.') or \
+           key.startswith('cond_stage_model.'):
+            sd_final[key] = value
+    
+    # Add UNet weights (with attn_importance)
+    for key, value in unet_weights.items():
+        # unet.* → model.diffusion_model.*
+        new_key = key.replace('unet.', 'model.diffusion_model.')
+        sd_final[new_key] = value
+    
+    # Count what we added
+    unet_base = [k for k in sd_final.keys() if k.startswith('model.diffusion_model.') and 'attn_importance' not in k]
+    unet_imp_added = [k for k in sd_final.keys() if k.startswith('model.diffusion_model.') and 'attn_importance' in k]
+    vae_keys = [k for k in sd_final.keys() if k.startswith('first_stage_model.')]
+    clip_keys = [k for k in sd_final.keys() if k.startswith('cond_stage_model.')]
+    
+    print(f"\n   SD Checkpoint composition:")
+    print(f"   - UNet (base): {len(unet_base)}")
+    print(f"   - UNet attn_importance (NEW): {len(unet_imp_added)}")
+    print(f"   - VAE: {len(vae_keys)}")
+    print(f"   - CLIP: {len(clip_keys)}")
+    print(f"   ────────────────────────")
+    print(f"   Total: {len(sd_final)}")
+    
+    # ========== Step 4: Build ControlNet Checkpoint (with importance) ==========
+    print("\n④ Building ControlNet checkpoint with importance...")
+    
+    controlnet_final = {}
+    
+    # Add ControlNet weights (with attn_importance)
+    for key, value in controlnet_weights.items():
+        # controlnet.* → keep as is or remove prefix
+        # DiffBIR v2.pth는 보통 prefix 없이 저장됨
+        new_key = key.replace('controlnet.', '')
+        controlnet_final[new_key] = value
+    
+    ctrl_base = [k for k in controlnet_final.keys() if 'attn_importance' not in k]
+    ctrl_imp_added = [k for k in controlnet_final.keys() if 'attn_importance' in k]
+    
+    print(f"\n   ControlNet Checkpoint composition:")
+    print(f"   - ControlNet (base): {len(ctrl_base)}")
+    print(f"   - ControlNet attn_importance (NEW): {len(ctrl_imp_added)}")
+    print(f"   ────────────────────────")
+    print(f"   Total: {len(controlnet_final)}")
+    
+    # ========== Step 5: Save SD Checkpoint ==========
+    print("\n⑤ Saving SD checkpoint...")
+    
+    sd_output_path = Path(exp_dir) / "sd_v2_with_importance.ckpt"
+    
+    sd_checkpoint_to_save = {
+        'state_dict': sd_final,
+        'training_info': {
+            'original_sd': cfg.train.sd_path,
+            'unet_attn_importance_modules': len([k for k in unet_imp_added if 'to_q.weight' in k]),
+            'description': 'Stable Diffusion v2.1 with ImportanceSpatialTransformer in UNet',
+        }
+    }
+    
+    torch.save(sd_checkpoint_to_save, sd_output_path)
+    sd_size_gb = sd_output_path.stat().st_size / (1024**3)
+    
+    print(f"   ✅ Saved SD checkpoint: {sd_output_path}")
+    print(f"   File size: {sd_size_gb:.2f} GB")
+    
+    # ========== Step 6: Save ControlNet Checkpoint ==========
+    print("\n⑥ Saving ControlNet checkpoint...")
+    
+    ctrl_output_path = Path(exp_dir) / "controlnet_v2_with_importance.pth"
+    
+    ctrl_checkpoint_to_save = {
+        'state_dict': controlnet_final,
+        'training_info': {
+            'original_controlnet': cfg.train.get('controlnet_path', 'initialized_from_unet'),
+            'controlnet_attn_importance_modules': len([k for k in ctrl_imp_added if 'to_q.weight' in k]),
+            'description': 'ControlNet with ImportanceSpatialTransformer',
+        }
+    }
+    
+    torch.save(ctrl_checkpoint_to_save, ctrl_output_path)
+    ctrl_size_gb = ctrl_output_path.stat().st_size / (1024**3)
+    
+    print(f"   ✅ Saved ControlNet checkpoint: {ctrl_output_path}")
+    print(f"   File size: {ctrl_size_gb:.2f} GB")
+    
+    # ========== Step 7: Verification ==========
+    print("\n⑦ Verifying checkpoints...")
+    
+    # Verify SD
+    verify_sd = torch.load(sd_output_path, map_location="cpu", weights_only=False)
+    verify_sd_state = verify_sd['state_dict']
+    
+    has_unet = any(k.startswith('model.diffusion_model.') for k in verify_sd_state.keys())
+    has_vae = any(k.startswith('first_stage_model.') for k in verify_sd_state.keys())
+    has_clip = any(k.startswith('cond_stage_model.') for k in verify_sd_state.keys())
+    has_unet_importance = any('model.diffusion_model.' in k and 'attn_importance' in k for k in verify_sd_state.keys())
+    
+    print(f"\n   SD Checkpoint:")
+    print(f"   {'✅' if has_unet else '❌'} UNet")
+    print(f"   {'✅' if has_vae else '❌'} VAE")
+    print(f"   {'✅' if has_clip else '❌'} CLIP")
+    print(f"   {'✅' if has_unet_importance else '❌'} UNet attn_importance")
+    
+    # Verify ControlNet
+    verify_ctrl = torch.load(ctrl_output_path, map_location="cpu", weights_only=False)
+    verify_ctrl_state = verify_ctrl['state_dict']
+    
+    has_ctrl_importance = any('attn_importance' in k for k in verify_ctrl_state.keys())
+    
+    print(f"\n   ControlNet Checkpoint:")
+    print(f"   {'✅' if len(verify_ctrl_state) > 0 else '❌'} ControlNet weights")
+    print(f"   {'✅' if has_ctrl_importance else '❌'} ControlNet attn_importance")
+    
+    # Sample keys
+    if has_unet_importance:
+        unet_imp_samples = [k for k in verify_sd_state.keys() if 'attn_importance' in k][:3]
+        print(f"\n   Sample UNet attn_importance keys:")
+        for k in unet_imp_samples:
+            print(f"      - {k}: {verify_sd_state[k].shape}")
+    
+    if has_ctrl_importance:
+        ctrl_imp_samples = [k for k in verify_ctrl_state.keys() if 'attn_importance' in k][:3]
+        print(f"\n   Sample ControlNet attn_importance keys:")
+        for k in ctrl_imp_samples:
+            print(f"      - {k}: {verify_ctrl_state[k].shape}")
+    
+    print("\n" + "="*80)
+    print("✅ FINAL CHECKPOINTS SAVED SUCCESSFULLY!")
+    print("="*80)
+    print(f"\n📦 Output files:")
+    print(f"   1. {sd_output_path} ({sd_size_gb:.2f} GB)")
+    print(f"   2. {ctrl_output_path} ({ctrl_size_gb:.2f} GB)")
+    print("\n💡 Usage:")
+    print(f"   - Use sd_v2_with_importance.ckpt as base SD model")
+    print(f"   - Use controlnet_v2_with_importance.pth for ControlLDM")
+    
+    return sd_output_path, ctrl_output_path
+
 
 if __name__ == "__main__":
     parser = ArgumentParser()
